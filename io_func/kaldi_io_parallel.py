@@ -37,6 +37,8 @@ from io_func import smart_open, skip_frame, sparse_tuple_from
 from feat_process.feature_transform import FeatureTransform
 from io_func.matio import read_next_utt
 from fst import *
+from io_func.kaldi_io_egs import NnetChainExample,ProcessEgsFeat
+
 
 # read the alignment of all the utterances and keep the alignment in CPU memory.
 def read_alignment(ali_file):
@@ -217,6 +219,35 @@ def PackageFeatAndAli(all_package, input_lock, package_end, scp_file, ali_file, 
     logging.info('------PackageFeatAndAli end. Package time is : %f s, batch bumber : %d' % (end_package - start_package, len(all_package)))
     return True
 
+def PackageEgs(all_package, input_lock, package_end, scp_file, nstreams):
+    logging.info('------start PackageEgs------')
+    start_package = time.time()
+    #all_package = []
+    scp_list = []
+    # first read egs scp file and package 
+    for line in open(scp_file, 'r'):
+        scp_list.append(line)
+        #print(len(scp_list),nstreams)
+        if len(scp_list) == nstreams:
+            input_lock.acquire()
+            all_package.append([scp_list])
+            input_lock.release()
+            scp_list = []
+
+    if len(scp_list) != 0:
+        input_lock.acquire()
+        all_package.append([scp_list])
+        input_lock.release()
+    
+    input_lock.acquire()
+    package_end.append(True)
+    input_lock.release()
+
+    end_package = time.time()
+    logging.info('------PackageFeatAndAli end. Package time is : %f s, batch bumber : %d' % (end_package - start_package, len(all_package)))
+    #print("********************")
+    return True
+
 class KaldiDataReadParallel(object):
     '''
     kaldi i.
@@ -254,6 +285,14 @@ class KaldiDataReadParallel(object):
         
         self.criterion = None
         self.feature_transform = None
+
+        # self.egs_dict = { key1: index, ...}
+        self.egs_dict = {}
+        # self.egs_queue = [[queue, ...],[size, ...]]
+        self.egs_queue = [[],[]]
+        self.max_egs_kind = 5
+
+        self.input_thread = []
         
     def Initialize(self, conf_dict = None, scp_file = None, label = None, feature_transform = None, criterion = None, lat_scp_file = None):
         for key in self.__dict__:
@@ -283,8 +322,8 @@ class KaldiDataReadParallel(object):
         
         if not os.path.exists(self.scp_file):
             raise 'no scp file'
-        if not os.path.exists(self.label):
-            raise 'no label file'
+        #if not os.path.exists(self.label):
+        #    raise 'no label file'
         # feature information
         self.input_feat_dim = 0
         self.output_feat_dim = 0
@@ -292,15 +331,23 @@ class KaldiDataReadParallel(object):
         # first read scp and ali to self.package_feat_ali 
         # store features and labels for each data partition
         self.package_feat_ali = []  # save format is [scp_line_list, ali_list]
-        self.read_offset = 0
 
         # Initial input queue.
         self.input_queue = multiprocessing.Queue(self.queue_cache)
 
         # shared memery
+        if 'chain' in self.criterion:
+            # self.egs_dict = { key1: index, ...}
+            self.egs_dict = multiprocessing.Manager().dict()
+            #self.max_egs_kind = multiprocessing.Value(ctypes.c_int, self.max_egs_kind, lock=True)
+            # self.egs_queue = [[queue, ...],[size, ...]]
+            for i in range(self.max_egs_kind):
+                self.egs_queue[0].append(multiprocessing.Value(ctypes.c_int, 0, lock=True))
+                self.egs_queue[1].append(multiprocessing.Queue(maxsize=0))
+        
         self.package_feat_ali = multiprocessing.Manager().list([])
         self.read_offset = multiprocessing.Value(ctypes.c_int, 0, lock=True)
-        self.package_end=multiprocessing.Manager().list([False])
+        self.package_end = multiprocessing.Manager().list([False])
 
         # read feature transform parameter
         if feature_transform != None:
@@ -331,11 +378,19 @@ class KaldiDataReadParallel(object):
         #if self.shuffle is True:
         #    random.shuffle(self.package_feat_ali)
         return self.output_feat_dim
+    
 
     # package input feats.scp, label and lattice.
     # save index to self.package_feat_ali
     def ThreadPackageFeatAndAli(self):
-        if self.lat_scp_file is None and 'mmi' not in self.criterion: 
+        if 'chain' in self.criterion:
+            load_thread = threading.Thread(group=None, target=PackageEgs,
+                    args=(self.package_feat_ali, self.input_lock, self.package_end,
+                        self.scp_file, self.batch_size),
+                    kwargs={}, name='PackageEgs_thread')
+            logging.info('PackageEgs thread start.')
+
+        elif self.lat_scp_file is None and 'mmi' not in self.criterion: 
             load_thread = threading.Thread(group=None, target=PackageFeatAndAli,
                     args=(self.package_feat_ali, self.input_lock, self.package_end, 
                         self.scp_file, self.label, 
@@ -343,6 +398,7 @@ class KaldiDataReadParallel(object):
                         self.max_input_seq_length, self.criterion,),
                     kwargs={}, name='PackageFeatAndAli_thread')
             logging.info('PackageFeatAndAli thread start.')
+
         else:
             load_thread = threading.Thread(group=None, target=PackageFeatAndAliAndLat,
                     args=(self.package_feat_ali, self.input_lock, self.package_end,
@@ -379,6 +435,104 @@ class KaldiDataReadParallel(object):
                 return 
             self.input_lock.release()
         logging.info('Reset and no shuffle package_feat_ali')
+
+    def PackBatchEgs(self):
+        name_list = []
+        feat_mat = []
+        fst_list = []
+        osize = 0
+        self.input_lock.acquire()
+        egs_len = len(self.egs_queue[0])
+        for i in range(egs_len):
+            if self.egs_queue[0][i].value >= self.batch_size:
+                #print("package one batch")
+                for n in range(self.batch_size):
+                    [name, feat, ofst, osize] = self.egs_queue[1][i].get()
+                    name_list.append(name)
+                    feat_mat.append(feat)
+                    fst_list.append(ofst)
+                self.egs_queue[0][i].value -= self.batch_size
+                self.input_lock.release()
+                max_frame_num = len(feat_mat[0])
+                valid_length = osize
+                fst_list = PackageFst(fst_list)
+                return feat_mat, None, valid_length, max_frame_num, fst_list
+
+        self.input_lock.release()
+        return None
+
+    # load chain egs
+    def LoadOnePackageEgs(self):
+        while True:
+            self.input_lock.acquire()
+            if self.read_offset.value >= len(self.package_feat_ali):
+                self.input_lock.release()
+                packfst = self.PackBatchEgs()
+                if packfst is not None:
+                    return packfst
+                self.input_lock.acquire()
+                if self.package_end[-1] is True:
+                    self.input_lock.release()
+                    return None, None, None, None, None
+                else:
+                    self.input_lock.release()
+                    time.sleep(0.01)
+                    continue
+            else:
+                package = self.package_feat_ali[self.read_offset.value]
+                self.read_offset.value += 1
+                self.input_lock.release()
+                
+                # read one batch egs
+                egs_scp = package[0]
+                splice_info = self.feature_transform.GetSplice()
+                for scp_line in egs_scp:
+                    chain_example = NnetChainExample()
+                    chain_example.ReadScp(scp_line)
+                    # process input features
+                    name = chain_example.GetKey()
+                    inputs = chain_example.Input()
+                    outputs = chain_example.Output()
+                    for iput,oput in zip(inputs,outputs):
+                        feat = iput.GetFeat()
+                        isize = iput.GetSize()
+                        # feature_transform
+                        feat = self.feature_transform.Propagate(feat)
+                        assert isize == np.shape(feat)[0]
+                        #  skip frame  
+                        feat = ProcessEgsFeat(feat, iput.GetIndex(), oput.GetIndex(), 
+                                self.feature_transform.GetSplice(), self.skip_offset)
+                        
+                        ofst = oput.GetFst()
+                        osize = oput.GetSize()
+                        
+                        def EgsKey(isize, osize):
+                            return str(isize) + '-' + str(osize)
+                        egskey = EgsKey(isize, osize)
+                        #print('name',name)
+                        self.input_lock.acquire()
+                        if egskey in self.egs_dict.keys():
+                            index = self.egs_dict[egskey]
+                            self.egs_queue[0][index].value += 1
+                            self.egs_queue[1][index].put([name, feat, ofst, osize])
+                            self.input_lock.release()
+                        else:
+                            index = len(self.egs_dict.keys())
+                            self.egs_dict[egskey] = index
+                            assert index < self.max_egs_kind
+                            self.egs_queue[0][index].value += 1
+                            self.egs_queue[1][index].put([name, feat, ofst, osize])
+
+                            self.input_lock.release()
+                    # end one NnetChainExample
+
+                packfst = self.PackBatchEgs()
+                if packfst is not None:
+                    # end one batch egs scp
+                    return packfst
+                else:
+                    continue
+                # continue next bacth egs scp
 
     def LoadOnePackage(self):
         while True:
@@ -449,6 +603,8 @@ class KaldiDataReadParallel(object):
                     feat,label,length,lattice = self.CnnSliceLoadNextNstreams()
             elif 'tdnn' in self.criterion:
                 feat,label,length,lattice = self.TdnnLoadNextNstreams()
+            elif 'chain' in self.criterion:
+                feat,label,length,lattice = self.ChainLoadNextNstreams()
             else:
                 if 'whole' in self.criterion or 'ctc' in self.criterion:
                     feat,label,length,lattice = self.WholeLoadNextNstreams()
@@ -458,8 +614,14 @@ class KaldiDataReadParallel(object):
                 if 'ctc' in self.criterion:
                     label = sparse_tuple_from(label)
             self.input_queue.put((feat,label,length,lattice))
+            
+            if feat is not None:
+                print(numpy.shape(feat))
+            else:
+                print(feat)
             if feat is None:
                 break
+        print('end LoadBatch')
 
     # because efficiency, so should use multiprocessing
     def ThreadPackageInput(self):
@@ -473,8 +635,18 @@ class KaldiDataReadParallel(object):
             logging.info('ProcessPackageInput start')
             thr.start()
     
+    def ClearEgsQueue(self):
+        self.input_lock.acquire()
+        #for i in range(len(self.egs_queue[0])):
+        for i in range(len(self.egs_queue[0])):
+            for n in range(self.egs_queue[0][i].value):
+                self.egs_queue[1][i].get()
+            self.egs_queue[0][i].value = 0
+        self.input_lock.release()
+    
     # must be join io thread
     def JoinInput(self):
+        self.ClearEgsQueue()
         for i in range(self.io_thread_num):
             self.input_thread[i].join()
         self.input_thread = []
@@ -492,6 +664,8 @@ class KaldiDataReadParallel(object):
                     continue
             else:
                 return feat,label,length,lattice
+
+
     
     # Tdnn frames features train.
     def TdnnLoadNextNstreams(self):
@@ -544,6 +718,19 @@ class KaldiDataReadParallel(object):
         inputdim = self.feature_transform.GetInDim()
         splicedim = int(outdim / inputdim)
         return feat.reshape(-1, splicedim, inputdim, 1), label, length, lat_list
+
+    # load chain egs batch data
+    def ChainLoadNextNstreams(self):
+        feat_mat, _, valid_length, max_frame_num, fst_list = self.LoadOnePackageEgs()
+
+        if feat_mat is None:
+            return None, None, None, None
+        if feat_mat.__len__() == self.batch_size:
+            feat_mat_nstream = numpy.hstack(feat_mat).reshape(-1, self.batch_size, self.output_dim)
+            return feat_mat_nstream , None, valid_length, fst_list
+        else:
+            return None, None, None, None
+
 
     # load batch_size features and labels, it's whole sentence train.
     def LoadNextNstreams(self):
@@ -663,7 +850,59 @@ class KaldiDataReadParallel(object):
         return pri
 
 if __name__ == '__main__':
-    path = '/search/odin/hubo/git/tf-code-acoustics/fst/cc/source/out-source'
+    path = '/search/speech/hubo/git/tf-code-acoustics/chain_source/egs-vecfst/'
+    conf_dict = { 'batch_size' :64,
+            'skip_offset': 0,
+            'shuffle': False,
+            'queue_cache':100,
+            'io_thread_num':20}
+
+    feat_trans_file = '../conf/final.feature_transform'
+    feat_trans = FeatureTransform()
+    feat_trans.LoadTransform(feat_trans_file)
+    logging.basicConfig(filename = 'test.log')
+    logging.getLogger().setLevel('INFO')
+    io_read = KaldiDataReadParallel()
+    
+    io_read.Initialize(conf_dict, scp_file=path+'cegs.1.scp',
+    #io_read.Initialize(conf_dict, scp_file=path+'../test.1.scp',
+            feature_transform = feat_trans, criterion = 'chain')
+    start = time.time()
+    io_read.Reset(shuffle = False)
+    batch_num = 0
+    while True:
+        start1 = time.time()
+        feat_mat, label, length, lat_list = io_read.GetInput()
+        #feat_mat, label, length, _, lat_list = io_read.LoadOnePackageEgs()
+        end1 = time.time()
+        if feat_mat is None:
+            break
+        logging.info('batch number: '+str(batch_num) + ' ' + str(numpy.shape(feat_mat)))
+        logging.info("time:"+str(end1-start1))
+        batch_num += 1
+    end = time.time()
+    io_read.JoinInput()
+    logging.info("all process time:"+str(end-start))
+    start = time.time()
+    io_read.Reset(shuffle = True)
+    batch_num = 0
+    while True:
+        start1 = time.time()
+        feat_mat, label, length, lat_list = io_read.GetInput()
+        #feat_mat, label, length, _, lat_list = io_read.LoadOnePackageEgs()
+        end1 = time.time()
+        if feat_mat is None:
+            break
+        logging.info('batch number: '+str(batch_num) + ' ' + str(numpy.shape(feat_mat)))
+        logging.info("time:"+str(end1-start1))
+        batch_num += 1
+    end = time.time()
+    io_read.JoinInput()
+    logging.info("all process time:"+str(end-start))
+
+'''
+if __name__ == '__main__':
+    path = '/search/speech/hubo/git/tf-code-acoustics/fst/cc/source/out-source'
     conf_dict = { 'batch_size' :10,
             'skip_frame':1,
             'skip_offset': 0,
@@ -730,4 +969,4 @@ if __name__ == '__main__':
     io_read.JoinInput()
     end = time.time()
     logging.info('load time is : %f s' % (end - start))
-
+'''

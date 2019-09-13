@@ -23,6 +23,7 @@ from util.tensor_io import print_trainable_variables
 
 import tensorflow as tf
 from tensorflow.python import debug as tf_debug
+from fst import Fst2SparseMatrix
 
 strset=('criterion', 'feature_transfile', 'checkpoint_dir')
 class TrainClass(object):
@@ -131,6 +132,15 @@ class TrainClass(object):
                 self.statesinfo = tf.placeholder(tf.int32, [self.batch_size_cf, None, 2], name="statesinfo")
                 self.num_states = tf.placeholder(tf.int32, [self.batch_size_cf], name="num_states")
                 self.lattice = [self.indexs, self.pdf_values, self.lm_ws, self.am_ws, self.statesinfo, self.num_states]
+            elif 'chain' in self.criterion_cf:
+                self.indexs = tf.placeholder(tf.int32, [self.batch_size_cf, None, 2], name="indexs")
+                self.in_labels = tf.placeholder(tf.int32, [self.batch_size_cf, None], name="in_labels")
+                self.weights = tf.placeholder(tf.float32, [self.batch_size_cf, None], name="weights")
+                self.statesinfo = tf.placeholder(tf.int32, [self.batch_size_cf, None, 2], name="statesinfo")
+                self.num_states = tf.placeholder(tf.int32, [self.batch_size_cf], name="num_states")
+                self.length = tf.placeholder(tf.int32, [None], name="length")
+                self.fst = [self.indexs, self.in_labels, self.weights, self.statesinfo, self.num_states]
+
             self.seq_len = tf.placeholder(tf.int32,[None], name = 'seq_len')
             
             #self.learning_rate_var_tf = tf.Variable(float(self.learning_rate_cf), 
@@ -224,6 +234,33 @@ class TrainClass(object):
                         time_major = True)
                 mean_loss = mpe_mean_loss
                 loss = mpe_loss
+            elif 'chain' in self.criterion_cf:
+                den_indexs, den_in_labels, den_weights, den_statesinfo, den_num_states, den_start_state, laststatesuperfinal = Fst2SparseMatrix(self.conf_dict['den_fst'])
+                label_dim = self.conf_dict['label_dim']
+                delete_laststatesuperfinal = True
+                l2_regularize = 0.0
+                leaky_hmm_coefficient = 1.0e-05
+                xent_regularize = 0.0
+                #den_indexs = tf.convert_to_tensor(den_indexs, name='den_indexs')
+                #den_in_labels = tf.convert_to_tensor(den_in_labels, name='den_in_labels')
+                #den_weights = tf.convert_to_tensor(den_weights, name='den_weights')
+                #den_statesinfo = tf.convert_to_tensor(den_statesinfo, name='den_statesinfo')
+                den_indexs = tf.make_tensor_proto(den_indexs)
+                den_in_labels = tf.make_tensor_proto(den_in_labels)
+                den_weights = tf.make_tensor_proto(den_weights)
+                den_statesinfo = tf.make_tensor_proto(den_statesinfo)
+                chain_mean_loss, chain_loss, label_error_rate, rnn_keep_state_op, rnn_state_zero_op = nnet_model.ChainLoss(
+                        self.X, 
+                        self.indexs, self.in_labels, self.weights, self.statesinfo, self.num_states, self.length,
+                        label_dim,
+                        den_indexs, den_in_labels, den_weights, den_statesinfo, den_num_states, 
+                        den_start_state, delete_laststatesuperfinal,
+                        l2_regularize, leaky_hmm_coefficient, xent_regularize)
+                mean_loss = chain_mean_loss
+                loss = chain_loss
+            else:
+                logging.info("no criterion.")
+                sys.exit(1)
 
             if self.use_sgd_cf and self.use_normal_cf: 
                 tvars = tf.trainable_variables()
@@ -457,6 +494,10 @@ class TrainClass(object):
                         'loss':self.run_ops['loss'],
                         'rnn_keep_state_op':self.run_ops['rnn_keep_state_op'],
                         'rnn_state_zero_op':self.run_ops['rnn_state_zero_op']}
+            elif 'chain' in self.criterion_cf:
+                run_op = {'train_op':self.run_ops['train_op'],
+                        'mean_loss':self.run_ops['mean_loss'],
+                        'loss':self.run_ops['loss']}
             else:
                 assert 'No train criterion.'
         else:
@@ -469,10 +510,13 @@ class TrainClass(object):
         #threadinput = self.ThreadInputFeatAndLab()
         time.sleep(3)
         with tf.device(device):
-            if 'ctc' in self.criterion_cf or 'whole' in self.criterion_cf:
+            if 'ctc' in self.criterion_cf or 'whole' in self.criterion_cf or 'chain' in self.criterion_cf:
                 self.WholeTrainFunction(0, run_op, 'train_ctc_thread_hubo')
             elif 'ce' in self.criterion_cf:
                 self.SliceTrainFunction(0, run_op, 'train_ce_thread_hubo')
+            else:
+                logging.info('no criterion in train')
+                sys.exit(1)
         
         tmp_label_error_rate = self.GetAverageLabelErrorRate()
         logging.info("current averagelabel error rate : %f" % tmp_label_error_rate)
@@ -514,6 +558,11 @@ class TrainClass(object):
                 feed_dict = {self.X : feat, self.Y : label, self.seq_len : length,
                         self.indexs : lat_list[0], self.pdf_values : lat_list[1], self.lm_ws : lat_list[2],
                         self.am_ws : lat_list[3], self.statesinfo : lat_list[4], self.num_states : lat_list[5]}
+            elif 'chain' in self.criterion_cf:
+                # length is valid_length is int
+                feed_dict = {self.X : feat, self.length : [length], 
+                        self.indexs : lat_list[0], self.in_labels : lat_list[1], self.weights : lat_list[2],
+                        self.statesinfo : lat_list[3], self.num_states : lat_list[4]}
             else:
                 feed_dict = {self.X : feat, self.Y : label, self.seq_len : length}
 
@@ -523,15 +572,20 @@ class TrainClass(object):
 
 
             print("thread_name: ", thread_name,  num_batch, " time:",time2-time1,time3-time2,time4-time3,time4-time1)
-            print('label_error_rate:',calculate_return['label_error_rate'])
+            if 'label_error_rate' in calculate_return.keys():
+                print('label_error_rate:',calculate_return['label_error_rate'])
+                total_curr_error_rate += calculate_return['label_error_rate']
+                self.acc_label_error_rate[gpu_id] += calculate_return['label_error_rate']
+            else:
+                total_curr_error_rate += 0.0
+                self.acc_label_error_rate[gpu_id] += 0.0
             print('mean_loss:',calculate_return['mean_loss'])
 
             total_curr_mean_loss += calculate_return['mean_loss']
             total_mean_loss += calculate_return['mean_loss']
 
             num_batch += 1
-            total_curr_error_rate += calculate_return['label_error_rate']
-            self.acc_label_error_rate[gpu_id] += calculate_return['label_error_rate']
+
             self.num_batch[gpu_id] += 1
             if self.num_batch[gpu_id] % int(self.steps_per_checkpoint_cf/50) == 0:
                 logging.info("Batch: %d current averagelabel error rate : %f, mean loss : %f" % (int(self.steps_per_checkpoint_cf/50), total_curr_error_rate / int(self.steps_per_checkpoint_cf/50),total_curr_mean_loss / int(self.steps_per_checkpoint_cf/50)))

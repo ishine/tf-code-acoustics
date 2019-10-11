@@ -258,7 +258,7 @@ class LstmModel(NnetBase):
             # add ReluLayer
             elif layer[0] == 'ReluLayer':
                 for relu in layer[1:]:
-                    tf.nn.relu(outputs[-1])
+                    outputs.append(tf.nn.relu(outputs[-1]))
                     #relu(outputs[-1])
             # add NormalizeLayer
             elif layer[0] == 'NormalizeLayer':
@@ -648,7 +648,7 @@ class LstmModel(NnetBase):
             label_dim,
             den_indexs, den_in_labels, den_weights, den_statesinfo, den_num_states,
             den_start_state = 0 ,delete_laststatesuperfinal = True,
-            l2_regularize = 0.0, leaky_hmm_coefficient = 0.0, xent_regularize =0.0):
+            l2_regularize = 0.00005, leaky_hmm_coefficient = 0.1, xent_regularize =0.025):
         seq_len = None
         last_output, rnn_keep_state_op, rnn_state_zero_op = self.CreateModel(
                 input_feats, seq_len)

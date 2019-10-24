@@ -17,8 +17,9 @@ using tensorflow::shape_inference::DimensionHandle;
 using tensorflow::shape_inference::InferenceContext;
 using tensorflow::shape_inference::ShapeHandle;
 
-REGISTER_OP("ChainLoss")
+REGISTER_OP("ChainXentLoss")
 	.Input("inputs: float")
+	.Input("inputs_xent: float")
 	.Input("indexs: int32")
 	.Input("in_labels: int32")
 	.Input("weights: float")
@@ -41,9 +42,11 @@ REGISTER_OP("ChainLoss")
 	.Attr("xent_regularize: float = 0.0")
 	.Output("objf: float")
 	.Output("gradient: float")
+	.Output("gradient_xent: float")
 	.SetShapeFn([](InferenceContext* c)
 	{
 		ShapeHandle inputs;         // nnet forward output
+		ShapeHandle inputs_xent;
 		ShapeHandle indexs;         // next inputs it's lattice info
 		ShapeHandle in_labels;
 		ShapeHandle weights;
@@ -53,12 +56,13 @@ REGISTER_OP("ChainLoss")
 
 		// check shape
 		TF_RETURN_IF_ERROR(c->WithRank(c->input(0), 3, &inputs));
-		TF_RETURN_IF_ERROR(c->WithRank(c->input(1), 3, &indexs));
-		TF_RETURN_IF_ERROR(c->WithRank(c->input(2), 2, &in_labels));
-		TF_RETURN_IF_ERROR(c->WithRank(c->input(3), 2, &weights));
-		TF_RETURN_IF_ERROR(c->WithRank(c->input(4), 3, &statesinfo));
-		TF_RETURN_IF_ERROR(c->WithRank(c->input(5), 1, &num_states));
-		TF_RETURN_IF_ERROR(c->WithRank(c->input(6), 2, &deriv_weights));
+		TF_RETURN_IF_ERROR(c->WithRank(c->input(1), 3, &inputs_xent));
+		TF_RETURN_IF_ERROR(c->WithRank(c->input(2), 3, &indexs));
+		TF_RETURN_IF_ERROR(c->WithRank(c->input(3), 2, &in_labels));
+		TF_RETURN_IF_ERROR(c->WithRank(c->input(4), 2, &weights));
+		TF_RETURN_IF_ERROR(c->WithRank(c->input(5), 3, &statesinfo));
+		TF_RETURN_IF_ERROR(c->WithRank(c->input(6), 1, &num_states));
+		TF_RETURN_IF_ERROR(c->WithRank(c->input(7), 2, &deriv_weights));
 
 		// Get batch size from inputs and sequence_length, and update inputs
 		// with the merged batch_size since it is returned.
@@ -70,6 +74,7 @@ REGISTER_OP("ChainLoss")
 
 		c->set_output(0, c->Vector(batch_size));
 		c->set_output(1, inputs);
+		c->set_output(2, inputs_xent);
 
 		return tf::Status::OK();
 	});
@@ -77,10 +82,10 @@ REGISTER_OP("ChainLoss")
 
 namespace chain_loss
 {
-class ChainLossOp: public tf::OpKernel
+class ChainXentLossOp: public tf::OpKernel
 {
 public:
-	explicit ChainLossOp(tf::OpKernelConstruction* ctx) : tf::OpKernel(ctx)
+	explicit ChainXentLossOp(tf::OpKernelConstruction* ctx) : tf::OpKernel(ctx)
 	{
 		// den fst data
 		OP_REQUIRES_OK(ctx, ctx->GetAttr("den_indexs", &_den_indexs));
@@ -135,6 +140,7 @@ public:
 #endif
 
 		const tf::Tensor* inputs;     // tensor<float, 3>
+		const tf::Tensor* inputs_xent;     // tensor<float, 3>
 		const tf::Tensor* indexs;     // tensor<int, 3>
 		const tf::Tensor* in_labels;  // matrix<int>
 		const tf::Tensor* weights;    // matrix<float>
@@ -146,6 +152,7 @@ public:
 		//const tf::Tensor* frames_per_sequence; // int
 
 		OP_REQUIRES_OK(ctx, ctx->input("inputs", &inputs));
+		OP_REQUIRES_OK(ctx, ctx->input("inputs_xent", &inputs_xent));
 		OP_REQUIRES_OK(ctx, ctx->input("indexs", &indexs));
 		OP_REQUIRES_OK(ctx, ctx->input("in_labels", &in_labels));
 		OP_REQUIRES_OK(ctx, ctx->input("weights", &weights));
@@ -155,9 +162,9 @@ public:
 		
 		OP_REQUIRES(ctx, inputs->shape().dims() == 3,
 				tf::errors::InvalidArgument("inputs is not a 3-Tensor"));
-
-		OP_REQUIRES(ctx, deriv_weights->shape().dims() == 2,
-				tf::errors::InvalidArgument("deriv_weights is not a 2-Tensor"));
+		
+		OP_REQUIRES(ctx, inputs_xent->shape().dims() == 3,
+				tf::errors::InvalidArgument("inputs_xent is not a 3-Tensor"));
 
 		OP_REQUIRES(ctx, indexs->shape().dims() == 3,
 				tf::errors::InvalidArgument("indexs is not a 3-Tensor"));
@@ -180,6 +187,7 @@ public:
 		const tf::int64 batch_size = inputs_shape.dim_size(1);
 		const tf::int64 num_classes_raw = inputs_shape.dim_size(2);
 		
+		//std::cout << "max_time:" << max_time << "\nbatch_size:" << batch_size << "\nnum_classes_raw:" << num_classes_raw << "\n_label_dim:" << _label_dim <<std::endl;
 		const tf::TensorShape& indexs_shape = indexs->shape();
 		const tf::int32 max_num_arcs = indexs_shape.dim_size(1);
 
@@ -201,16 +209,21 @@ public:
 
 		tf::Tensor* objf = nullptr;
 		OP_REQUIRES_OK(ctx, 
-				ctx->allocate_output("objf", tf::TensorShape({3}), &objf));
+				ctx->allocate_output("objf", tf::TensorShape({4}), &objf));
 		// malloc gradient space
 		tf::Tensor* gradient;
 		OP_REQUIRES_OK(ctx,
 				ctx->allocate_output("gradient", inputs_shape, &gradient));
 
+		tf::Tensor* gradient_xent;
+		OP_REQUIRES_OK(ctx,
+				ctx->allocate_output("gradient_xent", inputs_shape, &gradient_xent));
 
 		auto inputs_t = inputs->tensor<float, 3>();
+		auto inputs_xent_t = inputs_xent->tensor<float, 3>();
 		auto objf_t = objf->vec<float>();
 		auto gradient_t = gradient->tensor<float, 3>();
+		auto gradient_xent_t = gradient_xent->tensor<float, 3>();
 		auto deriv_weights_t = deriv_weights->tensor<float, 2>();
 
 		// gradient set zero
@@ -225,19 +238,21 @@ public:
 
 		// every sequences must be equal length.
 		float supervision_weights = 1.0;
-		int supervision_num_sequences = 1.0;
+		int supervision_num_sequences = 1;
 		int supervision_frames_per_sequence = max_time;
 
-		bool ret = ChainLossDen(indexs_t.data(), in_labels_t.data(), in_labels_t.data(), 
+		bool ret = ChainXentLossDen(indexs_t.data(), in_labels_t.data(), in_labels_t.data(), 
 				weights_t.data(), statesinfo_t.data(), num_states_t.data(),
 				max_num_arcs, max_num_states,
 				deriv_weights_t.data(),
 				supervision_weights, supervision_num_sequences, supervision_frames_per_sequence, 
 				_label_dim,
 				inputs_t.data(),
+				inputs_xent_t.data(),
 				max_time, batch_size, num_classes_raw,
 				_den_graph_saver,
 				gradient_t.data(),
+				gradient_xent_t.data(),
 				objf_t.data(),
 				_l2_regularize, _leaky_hmm_coefficient, _xent_regularize);
 
@@ -279,14 +294,14 @@ private:
 
 	hubo::DenominatorGraphSaver _den_graph_saver;
 
-	TF_DISALLOW_COPY_AND_ASSIGN(ChainLossOp);
+	TF_DISALLOW_COPY_AND_ASSIGN(ChainXentLossOp);
 };
 
-REGISTER_KERNEL_BUILDER(Name("ChainLoss")
+REGISTER_KERNEL_BUILDER(Name("ChainXentLoss")
 		.Device(::tf::DEVICE_CPU),
-		ChainLossOp);
+		ChainXentLossOp);
 
-REGISTER_KERNEL_BUILDER(Name("ChainLoss")
+REGISTER_KERNEL_BUILDER(Name("ChainXentLoss")
 		.Device(::tf::DEVICE_GPU)
 		.HostMemory("indexs")
 		.HostMemory("in_labels")
@@ -294,7 +309,7 @@ REGISTER_KERNEL_BUILDER(Name("ChainLoss")
 		.HostMemory("statesinfo")
 		.HostMemory("num_states")
 		.HostMemory("objf"),
-		ChainLossOp);
+		ChainXentLossOp);
 
 } // namespace
 

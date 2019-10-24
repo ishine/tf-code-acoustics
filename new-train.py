@@ -46,6 +46,7 @@ class TrainClass(object):
         self.learning_rate_cf = 0.1
         self.learning_rate_decay_steps_cf = 100000
         self.learning_rate_decay_rate_cf = 0.96
+        self.l2_scale_cf = 0.00005
         self.batch_size_cf = 16
         self.num_frames_batch_cf = 20
         self.reset_global_step_cf = True
@@ -122,7 +123,10 @@ class TrainClass(object):
                 self.Y = tf.placeholder(tf.int32, [self.batch_size_cf, None], name="labels")
             elif 'ce' in self.criterion_cf:
                 self.Y = tf.placeholder(tf.int32, [self.batch_size_cf, self.num_frames_batch_cf], name="labels")
-
+            elif 'chain' in self.criterion_cf:
+                self.Y = tf.placeholder(tf.float32, [self.batch_size_cf, None], name="labels")
+            
+            #
             if 'mmi' in self.criterion_cf or 'smbr' in self.criterion_cf or 'mpfe' in self.criterion_cf:
                 self.indexs = tf.placeholder(tf.int32, [self.batch_size_cf, None, 2], name="indexs")
                 self.pdf_values = tf.placeholder(tf.int32, [self.batch_size_cf, None], name="pdf_values")
@@ -147,7 +151,7 @@ class TrainClass(object):
             # init global_step and learning rate decay criterion
             #self.global_step=tf.train.get_or_create_global_step()
             self.global_step=tf.Variable(0, trainable=False, name = 'global_step',dtype=tf.int64)
-            exponential_decay = False
+            exponential_decay = True 
             piecewise_constant = False
             inverse_time_decay = False
             if exponential_decay == True:
@@ -279,13 +283,23 @@ class TrainClass(object):
                 den_in_labels = tf.make_tensor_proto(den_in_labels)
                 den_weights = tf.make_tensor_proto(den_weights)
                 den_statesinfo = tf.make_tensor_proto(den_statesinfo)
-                chain_mean_loss, chain_loss, label_error_rate, rnn_keep_state_op, rnn_state_zero_op = nnet_model.ChainLoss(
-                        self.X, 
-                        self.indexs, self.in_labels, self.weights, self.statesinfo, self.num_states, self.length,
-                        label_dim,
-                        den_indexs, den_in_labels, den_weights, den_statesinfo, den_num_states, 
-                        den_start_state, delete_laststatesuperfinal,
-                        l2_regularize, leaky_hmm_coefficient, xent_regularize)
+                if 'xent' in self.criterion_cf:
+                    xent_regularize = 0.025
+                    chain_mean_loss, chain_loss, label_error_rate, rnn_keep_state_op, rnn_state_zero_op = nnet_model.ChainXentLoss(
+                            self.X, self.Y,
+                            self.indexs, self.in_labels, self.weights, self.statesinfo, self.num_states, self.length,
+                            label_dim,
+                            den_indexs, den_in_labels, den_weights, den_statesinfo, den_num_states, 
+                            den_start_state, delete_laststatesuperfinal,
+                            l2_regularize, leaky_hmm_coefficient, xent_regularize)
+                else:
+                    chain_mean_loss, chain_loss, label_error_rate, rnn_keep_state_op, rnn_state_zero_op = nnet_model.ChainLoss(
+                            self.X, self.Y, 
+                            self.indexs, self.in_labels, self.weights, self.statesinfo, self.num_states, self.length,
+                            label_dim,
+                            den_indexs, den_in_labels, den_weights, den_statesinfo, den_num_states, 
+                            den_start_state, delete_laststatesuperfinal,
+                            l2_regularize, leaky_hmm_coefficient, xent_regularize)
                 mean_loss = chain_mean_loss
                 loss = chain_loss
             else:
@@ -295,9 +309,12 @@ class TrainClass(object):
             if self.use_sgd_cf :
                 tvars = tf.trainable_variables()
                 if self.use_normal_cf :
-                    l2_regu = tf.contrib.layers.l2_regularizer(0.5)
-                    lstm_vars = [ var for var in tvars if 'lstm' in var.name ]
-                    apply_l2_regu = tf.contrib.layers.apply_regularization(l2_regu, lstm_vars)
+                    apply_l2_regu = tf.add_n([ tf.nn.l2_loss(v) for v in tvars ]) * self.l2_scale_cf
+                    #l2_regu = tf.contrib.layers.l2_regularizer(0.5)
+                    #lstm_vars = [ var for var in tvars if 'lstm' in var.name ]
+                    #apply_l2_regu = tf.contrib.layers.apply_regularization(l2_regu, lstm_vars)
+                    #apply_l2_regu = tf.contrib.layers.apply_regularization(l2_regu, tvars)
+                    mean_loss = mean_loss + apply_l2_regu
 
                 #mean_loss = mean_loss + apply_l2_regu
                 #grads_var = optimizer.compute_gradients(mean_loss+apply_l2_regu,
@@ -315,7 +332,7 @@ class TrainClass(object):
                             zip(grads, tvars),
                             global_step=self.global_step)
                 else:
-                    train_op = optimizer.minimize(mean_loss + apply_l2_regu,
+                    train_op = optimizer.minimize(mean_loss,
                             global_step=self.global_step)
 
 
@@ -590,7 +607,8 @@ class TrainClass(object):
                         self.am_ws : lat_list[3], self.statesinfo : lat_list[4], self.num_states : lat_list[5]}
             elif 'chain' in self.criterion_cf:
                 # length is valid_length is int
-                feed_dict = {self.X : feat, self.length : [length], 
+                # self.Y is deriv_weights
+                feed_dict = {self.X : feat, self.Y : label, self.length : [length], 
                         self.indexs : lat_list[0], self.in_labels : lat_list[1], self.weights : lat_list[2],
                         self.statesinfo : lat_list[3], self.num_states : lat_list[4]}
             else:
@@ -610,18 +628,23 @@ class TrainClass(object):
                 total_curr_error_rate += 0.0
                 self.acc_label_error_rate[gpu_id] += 0.0
             print('mean_loss:',calculate_return['mean_loss'])
-
-            total_curr_mean_loss += calculate_return['mean_loss']
-            total_mean_loss += calculate_return['mean_loss']
+            print('loss:',calculate_return['loss'])
+            
+            if type(calculate_return['mean_loss']) is list:
+                total_curr_mean_loss += calculate_return['mean_loss'][0]
+                total_mean_loss += calculate_return['mean_loss'][0]
+            else:
+                total_curr_mean_loss += calculate_return['mean_loss']
+                total_mean_loss += calculate_return['mean_loss']
 
             num_batch += 1
 
             self.num_batch[gpu_id] += 1
             if self.num_batch[gpu_id] % int(self.steps_per_checkpoint_cf/50) == 0:
-                logging.info("Batch: %d current averagelabel error rate : %f, mean loss : %f" % (int(self.steps_per_checkpoint_cf/50), total_curr_error_rate / int(self.steps_per_checkpoint_cf/50),total_curr_mean_loss / int(self.steps_per_checkpoint_cf/50)))
+                logging.info("Batch: %d current averagelabel error rate : %s, mean loss : %s" % (int(self.steps_per_checkpoint_cf/50), str(total_curr_error_rate / int(self.steps_per_checkpoint_cf/50)), str(total_curr_mean_loss / int(self.steps_per_checkpoint_cf/50))))
                 total_curr_error_rate = 0.0
                 total_curr_mean_loss = 0.0
-                logging.info("Batch: %d current total averagelabel error rate : %f,  mean loss : %f" % (self.num_batch[gpu_id], self.acc_label_error_rate[gpu_id] / self.num_batch[gpu_id], total_mean_loss/ self.num_batch[gpu_id]))
+                logging.info("Batch: %d current total averagelabel error rate : %s,  mean loss : %s" % (self.num_batch[gpu_id], str(self.acc_label_error_rate[gpu_id] / self.num_batch[gpu_id]), str(total_mean_loss/ self.num_batch[gpu_id])))
         logging.info('******end TrainFunction******')
 
     def SliceTrainFunction(self, gpu_id, run_op, thread_name):
@@ -761,7 +784,7 @@ if __name__ == "__main__":
             shuffle = False
             if iter > 0:
                 shuffle = True
-            tmp_tr_err_rate = train_class.TrainLogic(device, shuffle = shuffle, train_loss = True, skip_offset = iter)
+            tmp_tr_err_rate = train_class.TrainLogic(device, shuffle = shuffle, train_loss = True, skip_offset = iter + task_index)
 
             train_end_t = time.time()
             logging.info("******train %d iter time is %f ******" % (iter, train_end_t-train_start_t))
